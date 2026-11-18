@@ -176,7 +176,7 @@ func TestService_UpdateKeepsExistingFile(t *testing.T) {
 	svc, err := NewService([]string{t.TempDir(), dir})
 	require.NoError(t, err)
 
-	require.NoError(t, svc.Update("wg0", func(c *Config) { c.SetRunning(running()) }))
+	require.NoError(t, svc.Update("wg0", func(c *Config) error { c.SetRunning(running()); return nil }))
 
 	cfg, err := svc.LoadConfig("wg0")
 	require.NoError(t, err)
@@ -193,7 +193,7 @@ func TestService_UpdateCreatesFileInFirstDir(t *testing.T) {
 	svc, err := NewService([]string{first, t.TempDir()})
 	require.NoError(t, err)
 
-	require.NoError(t, svc.Update("wg1", func(c *Config) { c.SetRunning(running()) }))
+	require.NoError(t, svc.Update("wg1", func(c *Config) error { c.SetRunning(running()); return nil }))
 
 	_, err = os.Stat(filepath.Join(first, "wg1.conf"))
 	assert.NoError(t, err)
@@ -201,12 +201,66 @@ func TestService_UpdateCreatesFileInFirstDir(t *testing.T) {
 
 func TestService_UpdateLeavesUnreadableFileAlone(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, os.Mkdir(filepath.Join(dir, "wg0.conf"), 0700))
+	path := filepath.Join(dir, "wg0.conf")
+	unreadable := "[Interface]\nPostUp = " + strings.Repeat("x", 128*1024) + "\n"
+	require.NoError(t, os.WriteFile(path, []byte(unreadable), 0600))
 	svc, err := NewService([]string{dir})
 	require.NoError(t, err)
 
-	err = svc.Update("wg0", func(c *Config) { c.SetRunning(running()) })
+	err = svc.Update("wg0", func(c *Config) error { c.SetRunning(running()); return nil })
 	assert.Error(t, err)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, unreadable, string(data))
+}
+
+func TestService_UpdateWritesNothingWhenEditFails(t *testing.T) {
+	dir := t.TempDir()
+	svc, err := NewService([]string{dir})
+	require.NoError(t, err)
+
+	err = svc.Update("wg0", func(c *Config) error { return os.ErrPermission })
+	assert.ErrorIs(t, err, os.ErrPermission)
+
+	_, err = os.Stat(filepath.Join(dir, "wg0.conf"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// wg-quick ignores everything after a "#", so inline comments must neither
+// hide a peer nor end up in a value.
+func TestConfig_InlineComments(t *testing.T) {
+	file := `[Interface]
+Address = 10.0.0.1/24 # main
+PrivateKey = K=
+
+# Alice
+[Peer]
+PublicKey = ALICE= # phone
+AllowedIPs = 10.0.0.2/32 # phone
+PersistentKeepalive = 25
+
+# end of file
+`
+	cfg := parse(t, file)
+	assert.Equal(t, []string{"10.0.0.1/24"}, cfg.Options().Addresses)
+
+	cfg.SetRunning(&entity.Device{PrivateKey: "K="}, []entity.Peer{
+		{PublicKey: "ALICE=", AllowedIPs: []string{"10.0.0.2/32"}, PersistentKeepaliveInterval: "25s"},
+	})
+	assert.Equal(t, file, string(cfg.Bytes()))
+}
+
+func TestConfig_RemovingLastPeerKeepsEndOfFileComment(t *testing.T) {
+	cfg := parse(t, serverConfig+"\n# end of file\n")
+	cfg.SetRunning(&entity.Device{PrivateKey: "OLDKEY=", ListenPort: 51000, FirewallMark: 16}, []entity.Peer{
+		{PublicKey: "ALICE=", AllowedIPs: []string{"10.0.0.2/32"}},
+	})
+
+	out := string(cfg.Bytes())
+	assert.NotContains(t, out, "BOB=")
+	assert.NotContains(t, out, "# Bob phone")
+	assert.True(t, strings.HasSuffix(out, "AllowedIPs = 10.0.0.2/32\n\n# end of file\n"), out)
 }
 
 func TestListConfigDevices(t *testing.T) {

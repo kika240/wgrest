@@ -17,32 +17,40 @@ type configStore struct {
 	wgquickSvc *wgquick.Service
 }
 
-// save writes the running state of a device to its config file, and opts too
-// when given. Settings it does not own are kept.
-func (s configStore) save(name string, opts *entity.QuickOptions) error {
-	device, err := s.wgClient.Get(name)
-	if err != nil {
-		return err
-	}
-	peers, err := s.wgClient.ListPeers(name)
-	if err != nil {
-		return err
-	}
-
-	return s.wgquickSvc.Update(name, func(cfg *wgquick.Config) {
-		cfg.SetRunning(device, peers)
-		if opts != nil {
-			cfg.SetOptions(*opts)
+// save writes the running state of a device to its config file. When apply is
+// given, it also changes the wg-quick options found in the file. It returns
+// the options the file ends up with.
+func (s configStore) save(name string, apply func(*entity.QuickOptions)) (entity.QuickOptions, error) {
+	var opts entity.QuickOptions
+	err := s.wgquickSvc.Update(name, func(cfg *wgquick.Config) error {
+		device, err := s.wgClient.Get(name)
+		if err != nil {
+			return err
 		}
+		peers, err := s.wgClient.ListPeers(name)
+		if err != nil {
+			return err
+		}
+
+		cfg.SetRunning(device, peers)
+		opts = cfg.Options()
+		if apply != nil {
+			apply(&opts)
+			cfg.SetOptions(opts)
+		}
+		return nil
 	})
+	return opts, err
 }
 
 // saveOrLog is for API calls that already changed the running interface:
 // failing them would hide that change, so a failed save is logged instead.
-func (s configStore) saveOrLog(name string, opts *entity.QuickOptions) {
-	if err := s.save(name, opts); err != nil {
+func (s configStore) saveOrLog(name string, apply func(*entity.QuickOptions)) entity.QuickOptions {
+	opts, err := s.save(name, apply)
+	if err != nil {
 		log.Printf("Config for %s was not saved: %v", name, err)
 	}
+	return opts
 }
 
 // saveAll saves every running device.
@@ -54,7 +62,7 @@ func (s configStore) saveAll() error {
 
 	var errs []error
 	for _, d := range devices {
-		if err := s.save(d.Name, nil); err != nil {
+		if _, err := s.save(d.Name, nil); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", d.Name, err))
 		}
 	}

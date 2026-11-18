@@ -83,8 +83,10 @@ func (s *Service) LoadConfig(name string) (*Config, error) {
 
 // Update applies edit to the config file of name and writes it back
 // atomically. A missing file starts empty. A file that exists but cannot be
-// read is left alone, since rewriting it would lose its content.
-func (s *Service) Update(name string, edit func(*Config)) error {
+// read is left alone, since rewriting it would lose its content. Updates of
+// the same service run one at a time, so edit should read the state it
+// writes, to never write back an older state over a newer one.
+func (s *Service) Update(name string, edit func(*Config) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -97,7 +99,9 @@ func (s *Service) Update(name string, edit func(*Config)) error {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 
-	edit(cfg)
+	if err := edit(cfg); err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err

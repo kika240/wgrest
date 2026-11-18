@@ -16,6 +16,9 @@ import (
 // formatting of unchanged values and keys it does not know (SaveConfig, ...).
 type Config struct {
 	sections []*section
+	// trailer holds the comments and blank lines after the last key of the
+	// file. They describe the file, not its last peer.
+	trailer []string
 }
 
 // section is one [Interface] or [Peer] block. The first section of a file has
@@ -50,6 +53,7 @@ func ParseConfig(r io.Reader) (*Config, error) {
 		}
 		cur.lines = append(cur.lines, line)
 	}
+	cur.lines, c.trailer = splitAfterLastKey(cur.lines)
 
 	return c, scanner.Err()
 }
@@ -64,6 +68,7 @@ func (c *Config) Bytes() []byte {
 		}
 		lines = append(lines, s.lines...)
 	}
+	lines = append(lines, c.trailer...)
 	if len(lines) == 0 {
 		return nil
 	}
@@ -185,10 +190,12 @@ func isSection(header, want string) bool {
 	return strings.EqualFold(strings.TrimSpace(header), want)
 }
 
-// keyValue splits a "Key = Value" line. Comments and blank lines have no key.
+// keyValue splits a "Key = Value" line. Like wg-quick, it ignores everything
+// after a "#", so comments and blank lines have no key.
 func keyValue(line string) (key, value string, ok bool) {
-	t := strings.TrimSpace(line)
-	if t == "" || strings.HasPrefix(t, "#") {
+	t, _, _ := strings.Cut(line, "#")
+	t = strings.TrimSpace(t)
+	if t == "" {
 		return "", "", false
 	}
 	k, v, ok := strings.Cut(t, "=")

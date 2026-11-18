@@ -40,13 +40,39 @@ func (c *Client) Close() error {
 	return c.ctrl.Close()
 }
 
+// recorded returns the utunX interface that wg-quick recorded for a logical
+// name. Like wg-quick, it trusts the record only if the interface's socket
+// exists and was created within two seconds of it: a leftover record from a
+// crashed wireguard-go can point at a utunX that now belongs to another
+// interface.
+func (c *Client) recorded(name string) (string, bool) {
+	nameFile := filepath.Join(c.runDir, name+".name")
+	data, err := os.ReadFile(nameFile)
+	if err != nil {
+		return "", false
+	}
+	real := strings.TrimSpace(string(data))
+	if real == "" {
+		return "", false
+	}
+	nameInfo, err := os.Stat(nameFile)
+	if err != nil {
+		return "", false
+	}
+	sockInfo, err := os.Stat(filepath.Join(c.runDir, real+".sock"))
+	if err != nil {
+		return "", false
+	}
+	diff := sockInfo.ModTime().Sub(nameInfo.ModTime())
+	if diff >= 2*time.Second || diff <= -2*time.Second {
+		return "", false
+	}
+	return real, true
+}
+
 // realName returns the kernel interface behind a logical name.
 func (c *Client) realName(name string) string {
-	data, err := os.ReadFile(filepath.Join(c.runDir, name+".name"))
-	if err != nil {
-		return name
-	}
-	if real := strings.TrimSpace(string(data)); real != "" {
+	if real, ok := c.recorded(name); ok {
 		return real
 	}
 	return name
@@ -59,12 +85,12 @@ func (c *Client) logicalName(real string) string {
 		return real
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".name") {
+		logical, ok := strings.CutSuffix(e.Name(), ".name")
+		if !ok || e.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(c.runDir, e.Name()))
-		if err == nil && strings.TrimSpace(string(data)) == real {
-			return strings.TrimSuffix(e.Name(), ".name")
+		if r, ok := c.recorded(logical); ok && r == real {
+			return logical
 		}
 	}
 	return real
@@ -451,11 +477,16 @@ func deviceToEntity(d *wgtypes.Device) entity.Device {
 
 	networks := getDeviceNetworks(d.Name)
 
+	privateKey := ""
+	if d.PrivateKey != EmptyKey {
+		privateKey = d.PrivateKey.String()
+	}
+
 	return entity.Device{
 		Name:               d.Name,
 		ListenPort:         int32(d.ListenPort),
 		PublicKey:          d.PublicKey.String(),
-		PrivateKey:         d.PrivateKey.String(),
+		PrivateKey:         privateKey,
 		FirewallMark:       int32(d.FirewallMark),
 		QuickOptions:       entity.QuickOptions{Addresses: networks},
 		PeersCount:         int32(len(d.Peers)),

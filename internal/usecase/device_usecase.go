@@ -1,6 +1,8 @@
 package usecase
 
 import (
+	"log"
+
 	"github.com/suquant/wgrest/internal/domain/entity"
 	"github.com/suquant/wgrest/internal/infrastructure/wgquick"
 	"github.com/suquant/wgrest/internal/infrastructure/wireguard"
@@ -48,9 +50,13 @@ func (uc *DeviceUseCase) ListDevices(page, perPage int) ([]entity.Device, int, e
 		if runningNames[name] {
 			continue
 		}
+		device := entity.Device{Name: name}
 		if cfg, err := uc.wgquickSvc.LoadConfig(name); err == nil {
-			configOnlyDevices = append(configOnlyDevices, cfg.Device(name))
+			device = cfg.Device(name)
+		} else {
+			log.Printf("Config for %s could not be read: %v", name, err)
 		}
+		configOnlyDevices = append(configOnlyDevices, device)
 	}
 
 	// Merge: running first, then config-only
@@ -90,9 +96,8 @@ func (uc *DeviceUseCase) GetDevice(name string) (*entity.Device, error) {
 	if cfgErr != nil {
 		return nil, err
 	}
-	device = new(entity.Device)
-	*device = cfg.Device(name)
-	return device, nil
+	d := cfg.Device(name)
+	return &d, nil
 }
 
 // CreateDevice creates a new device and writes its wg-quick config.
@@ -118,9 +123,7 @@ func (uc *DeviceUseCase) UpdateDevice(name string, req entity.DeviceCreateOrUpda
 // applyOptions applies the request's wg-quick options on top of what the
 // config file already has, and saves the result.
 func (uc *DeviceUseCase) applyOptions(device *entity.Device, req entity.DeviceCreateOrUpdateRequest) {
-	uc.configs.describe(device)
-	req.ApplyOptions(&device.QuickOptions)
-	uc.configs.saveOrLog(device.Name, &device.QuickOptions)
+	device.QuickOptions = uc.configs.saveOrLog(device.Name, req.ApplyOptions)
 }
 
 // SaveAll saves the running state of every device to its config file.
