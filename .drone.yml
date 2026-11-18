@@ -19,17 +19,17 @@ environment:
 
 steps:
   - name: deps
-    image: golang:1.17.3-alpine3.14
+    image: golang:1.25-alpine3.22
     volumes:
       - name: cache
         path: /cache
     commands:
       - apk --no-cache add git
-      - go get -t -d -v ./...
-      - go build all
+      - go mod download
+      - go build ./...
 
   - name: build
-    image: golang:1.17.3-alpine3.14
+    image: golang:1.25-alpine3.22
     privileged: true
     volumes:
       - name: cache
@@ -44,7 +44,7 @@ steps:
       - deps
 
   - name: build packages
-    image: alpine:3.14.3
+    image: alpine:3.22
     volumes:
       - name: dist
         path: /drone/src/dist

@@ -3,7 +3,6 @@ package storage
 import (
 	"encoding/base64"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-	"io/ioutil"
 	"os"
 	"path"
 )
@@ -26,7 +25,7 @@ func (s *FileStorage) getFilePath(name string) string {
 
 func (s *FileStorage) WriteDeviceOptions(name string, options StoreDeviceOptions) error {
 	filePath := s.getFilePath(name)
-	f, err := ioutil.TempFile(s.dir, name)
+	f, err := os.CreateTemp(s.dir, name)
 	if err != nil {
 		return err
 	}
@@ -46,7 +45,7 @@ func (s *FileStorage) WriteDeviceOptions(name string, options StoreDeviceOptions
 func (s *FileStorage) WritePeerOptions(pubKey wgtypes.Key, options StorePeerOptions) error {
 	safeName := base64.URLEncoding.EncodeToString(pubKey[:])
 	filePath := s.getFilePath(safeName)
-	f, err := ioutil.TempFile(s.dir, safeName)
+	f, err := os.CreateTemp(s.dir, safeName)
 	if err != nil {
 		return err
 	}
