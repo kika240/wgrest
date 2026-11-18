@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -22,6 +21,9 @@ var EmptyKey = wgtypes.Key{}
 // Client provides access to WireGuard devices via wgctrl.
 type Client struct {
 	ctrl *wgctrl.Client
+	// runDir is where wg-quick on macOS/BSD records which utunX interface
+	// backs a logical name such as wg0 (wg0.name contains "utun7").
+	runDir string
 }
 
 // NewClient creates a new WireGuard client.
@@ -30,7 +32,7 @@ func NewClient() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{ctrl: ctrl}, nil
+	return &Client{ctrl: ctrl, runDir: "/var/run/wireguard"}, nil
 }
 
 // Close closes the WireGuard client.
@@ -38,26 +40,86 @@ func (c *Client) Close() error {
 	return c.ctrl.Close()
 }
 
-// resolveInterfaceName resolves the actual interface name for a logical name.
-// On macOS/BSD, wg-quick maps wg0 -> utunX and stores mapping in /var/run/wireguard/wg0.name
-func resolveInterfaceName(name string) string {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "freebsd" {
-		return name
-	}
-
-	// Check if there's a name mapping file
-	nameFile := filepath.Join("/var/run/wireguard", name+".name")
+// recorded returns the utunX interface that wg-quick recorded for a logical
+// name. Like wg-quick, it trusts the record only if the interface's socket
+// exists and was created within two seconds of it: a leftover record from a
+// crashed wireguard-go can point at a utunX that now belongs to another
+// interface.
+func (c *Client) recorded(name string) (string, bool) {
+	nameFile := filepath.Join(c.runDir, name+".name")
 	data, err := os.ReadFile(nameFile)
 	if err != nil {
-		return name // No mapping, use original name
+		return "", false
 	}
-
-	realName := strings.TrimSpace(string(data))
-	if realName == "" {
-		return name
+	real := strings.TrimSpace(string(data))
+	if real == "" {
+		return "", false
 	}
+	nameInfo, err := os.Stat(nameFile)
+	if err != nil {
+		return "", false
+	}
+	sockInfo, err := os.Stat(filepath.Join(c.runDir, real+".sock"))
+	if err != nil {
+		return "", false
+	}
+	diff := sockInfo.ModTime().Sub(nameInfo.ModTime())
+	if diff >= 2*time.Second || diff <= -2*time.Second {
+		return "", false
+	}
+	return real, true
+}
 
-	return realName
+// realName returns the kernel interface behind a logical name.
+func (c *Client) realName(name string) string {
+	if real, ok := c.recorded(name); ok {
+		return real
+	}
+	return name
+}
+
+// logicalName is the inverse of realName.
+func (c *Client) logicalName(real string) string {
+	entries, err := os.ReadDir(c.runDir)
+	if err != nil {
+		return real
+	}
+	for _, e := range entries {
+		logical, ok := strings.CutSuffix(e.Name(), ".name")
+		if !ok || e.IsDir() {
+			continue
+		}
+		if r, ok := c.recorded(logical); ok && r == real {
+			return logical
+		}
+	}
+	return real
+}
+
+// device reads a device by its logical name.
+func (c *Client) device(name string) (*wgtypes.Device, error) {
+	d, err := c.ctrl.Device(c.realName(name))
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "does not exist") ||
+			strings.Contains(err.Error(), "no such file") ||
+			strings.Contains(err.Error(), "not found") {
+			return nil, fmt.Errorf("device %s not found", name)
+		}
+		return nil, fmt.Errorf("failed to get device %s: %w", name, err)
+	}
+	return d, nil
+}
+
+// configure configures a device by its logical name.
+func (c *Client) configure(name string, cfg wgtypes.Config) error {
+	return c.ctrl.ConfigureDevice(c.realName(name), cfg)
+}
+
+// toEntity converts a device, naming it by its logical name.
+func (c *Client) toEntity(d *wgtypes.Device) entity.Device {
+	device := deviceToEntity(d)
+	device.Name = c.logicalName(d.Name)
+	return device
 }
 
 // List returns all WireGuard devices.
@@ -69,7 +131,7 @@ func (c *Client) List() ([]entity.Device, error) {
 
 	result := make([]entity.Device, len(devices))
 	for i, d := range devices {
-		result[i] = deviceToEntity(d)
+		result[i] = c.toEntity(d)
 	}
 
 	return result, nil
@@ -77,20 +139,12 @@ func (c *Client) List() ([]entity.Device, error) {
 
 // Get returns a specific device by name.
 func (c *Client) Get(name string) (*entity.Device, error) {
-	// Resolve actual interface name (macOS uses utunX)
-	realName := resolveInterfaceName(name)
-
-	d, err := c.ctrl.Device(realName)
+	d, err := c.device(name)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("device %s not found", name)
-		}
 		return nil, err
 	}
 
-	device := deviceToEntity(d)
-	// Preserve logical name (wg0) instead of real name (utun7)
-	device.Name = name
+	device := c.toEntity(d)
 	return &device, nil
 }
 
@@ -102,13 +156,11 @@ func (c *Client) Create(req entity.DeviceCreateOrUpdateRequest) (*entity.Device,
 
 	name := *req.Name
 
-	// Check if device already exists
-	_, err := c.ctrl.Device(name)
+	_, err := c.device(name)
 	if err == nil {
 		return nil, fmt.Errorf("device %s already exists", name)
 	}
 
-	// Build configuration
 	cfg := wgtypes.Config{}
 
 	if req.PrivateKey != nil {
@@ -129,7 +181,7 @@ func (c *Client) Create(req entity.DeviceCreateOrUpdateRequest) (*entity.Device,
 		cfg.FirewallMark = &mark
 	}
 
-	if err := c.ctrl.ConfigureDevice(name, cfg); err != nil {
+	if err := c.configure(name, cfg); err != nil {
 		return nil, err
 	}
 
@@ -138,12 +190,7 @@ func (c *Client) Create(req entity.DeviceCreateOrUpdateRequest) (*entity.Device,
 
 // Update updates an existing WireGuard device.
 func (c *Client) Update(name string, req entity.DeviceCreateOrUpdateRequest) (*entity.Device, error) {
-	// Check if device exists
-	_, err := c.ctrl.Device(name)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("device %s not found", name)
-		}
+	if _, err := c.device(name); err != nil {
 		return nil, err
 	}
 
@@ -167,7 +214,7 @@ func (c *Client) Update(name string, req entity.DeviceCreateOrUpdateRequest) (*e
 		cfg.FirewallMark = &mark
 	}
 
-	if err := c.ctrl.ConfigureDevice(name, cfg); err != nil {
+	if err := c.configure(name, cfg); err != nil {
 		return nil, err
 	}
 
@@ -183,19 +230,9 @@ func (c *Client) Delete(name string) error {
 
 // ListPeers returns all peers for a device.
 func (c *Client) ListPeers(deviceName string) ([]entity.Peer, error) {
-	// Resolve actual interface name (macOS uses utunX)
-	realName := resolveInterfaceName(deviceName)
-
-	d, err := c.ctrl.Device(realName)
+	d, err := c.device(deviceName)
 	if err != nil {
-		// Handle various "not found" errors across platforms
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "does not exist") ||
-			strings.Contains(err.Error(), "no such file") ||
-			strings.Contains(err.Error(), "not found") {
-			return nil, fmt.Errorf("device %s not found", deviceName)
-		}
-		// Return actual error for debugging
-		return nil, fmt.Errorf("failed to get device %s: %w", deviceName, err)
+		return nil, err
 	}
 
 	result := make([]entity.Peer, len(d.Peers))
@@ -213,14 +250,8 @@ func (c *Client) GetPeer(deviceName string, urlSafePubKey string) (*entity.Peer,
 		return nil, err
 	}
 
-	// Resolve actual interface name (macOS uses utunX)
-	realName := resolveInterfaceName(deviceName)
-
-	d, err := c.ctrl.Device(realName)
+	d, err := c.device(deviceName)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("device %s not found", deviceName)
-		}
 		return nil, err
 	}
 
@@ -236,11 +267,8 @@ func (c *Client) GetPeer(deviceName string, urlSafePubKey string) (*entity.Peer,
 
 // CreatePeer creates a new peer for a device.
 func (c *Client) CreatePeer(deviceName string, req entity.PeerCreateOrUpdateRequest) (*entity.Peer, error) {
-	d, err := c.ctrl.Device(deviceName)
+	d, err := c.device(deviceName)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("device %s not found", deviceName)
-		}
 		return nil, err
 	}
 
@@ -254,7 +282,6 @@ func (c *Client) CreatePeer(deviceName string, req entity.PeerCreateOrUpdateRequ
 		}
 		peerCfg.PublicKey = key
 	} else {
-		// Generate new key pair
 		privateKey, err := wgtypes.GeneratePrivateKey()
 		if err != nil {
 			return nil, err
@@ -343,15 +370,11 @@ func (c *Client) UpdatePeer(deviceName string, urlSafePubKey string, req entity.
 		return nil, err
 	}
 
-	d, err := c.ctrl.Device(deviceName)
+	d, err := c.device(deviceName)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("device %s not found", deviceName)
-		}
 		return nil, err
 	}
 
-	// Find existing peer
 	var existingPeer *wgtypes.Peer
 	for _, p := range d.Peers {
 		if p.PublicKey.String() == pubKey.String() {
@@ -424,7 +447,6 @@ func (c *Client) DeletePeer(deviceName string, urlSafePubKey string) (*entity.Pe
 		return nil, err
 	}
 
-	// Get peer info before deletion
 	peer, err := c.GetPeer(deviceName, urlSafePubKey)
 	if err != nil {
 		return nil, err
@@ -439,16 +461,11 @@ func (c *Client) DeletePeer(deviceName string, urlSafePubKey string) (*entity.Pe
 		Peers: []wgtypes.PeerConfig{peerCfg},
 	}
 
-	if err := c.ctrl.ConfigureDevice(deviceName, cfg); err != nil {
+	if err := c.configure(deviceName, cfg); err != nil {
 		return nil, err
 	}
 
 	return peer, nil
-}
-
-// GetDevice returns the raw wgtypes.Device for advanced operations.
-func (c *Client) GetDevice(name string) (*wgtypes.Device, error) {
-	return c.ctrl.Device(name)
 }
 
 func deviceToEntity(d *wgtypes.Device) entity.Device {
@@ -460,13 +477,18 @@ func deviceToEntity(d *wgtypes.Device) entity.Device {
 
 	networks := getDeviceNetworks(d.Name)
 
+	privateKey := ""
+	if d.PrivateKey != EmptyKey {
+		privateKey = d.PrivateKey.String()
+	}
+
 	return entity.Device{
 		Name:               d.Name,
 		ListenPort:         int32(d.ListenPort),
 		PublicKey:          d.PublicKey.String(),
-		PrivateKey:         d.PrivateKey.String(),
+		PrivateKey:         privateKey,
 		FirewallMark:       int32(d.FirewallMark),
-		Addresses:          networks,
+		QuickOptions:       entity.QuickOptions{Addresses: networks},
 		PeersCount:         int32(len(d.Peers)),
 		TotalReceiveBytes:  totalReceive,
 		TotalTransmitBytes: totalTransmit,

@@ -140,17 +140,14 @@ func main() {
 				return fmt.Errorf("failed to create wgquick service: %w", err)
 			}
 
-			// Initialize dump service
-			dumpInterval := c.Duration("dump-interval")
-			dumpService := dump.NewService(dumpInterval, wgClient, wgquickSvc)
-
-			// Start dump service in background
-			go dumpService.Start(ctx)
-			log.Printf("Config dump service started (interval: %s, dirs: %v)", dumpInterval, configDirs)
-
 			// Initialize use cases
 			deviceUC := usecase.NewDeviceUseCase(wgClient, wgquickSvc)
 			peerUC := usecase.NewPeerUseCase(wgClient, wgquickSvc)
+
+			// Start dump service in background
+			dumpInterval := c.Duration("dump-interval")
+			go dump.NewService(dumpInterval, deviceUC).Start(ctx)
+			log.Printf("Config dump service started (interval: %s, dirs: %v)", dumpInterval, configDirs)
 
 			// Initialize handlers
 			deviceHandler := handler.NewDeviceHandler(deviceUC)

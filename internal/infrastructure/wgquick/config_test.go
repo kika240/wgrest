@@ -2,6 +2,7 @@ package wgquick
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,212 +12,255 @@ import (
 	"github.com/suquant/wgrest/internal/domain/entity"
 )
 
-func TestParseConfig_Basic(t *testing.T) {
-	configStr := `[Interface]
-PrivateKey = cGVla2Fib28K
-ListenPort = 51820
+// serverConfig is a hand-written wg-quick file with everything a dump must
+// not lose: wg-quick-only keys, keys wgrest does not know, comments, hex
+// numbers and a peer named by a comment.
+const serverConfig = `# Managed by hand
+[Interface]
+# Server side
+Address = 10.0.0.1/24, fd00::1/64
+PrivateKey = OLDKEY=
+ListenPort = 51000
+FwMark = 0x10
+DNS = 1.1.1.1
+MTU = 1420
+Table = off
+SaveConfig = false
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 
+# Alice laptop
 [Peer]
-PublicKey = cHVibGljS2V5Cg==
+PublicKey = ALICE=
 AllowedIPs = 10.0.0.2/32
-Endpoint = 192.168.1.1:51820
+
+# Bob phone
+[Peer]
+PublicKey = BOB=
+AllowedIPs = 10.0.0.3/32
 `
 
-	cfg, err := ParseConfig(strings.NewReader(configStr))
+func parse(t *testing.T, s string) *Config {
+	t.Helper()
+	cfg, err := ParseConfig(strings.NewReader(s))
 	require.NoError(t, err)
-
-	assert.Equal(t, "cGVla2Fib28K", cfg.PrivateKey)
-	assert.Equal(t, 51820, cfg.ListenPort)
-	assert.Len(t, cfg.Peers, 1)
-	assert.Equal(t, "cHVibGljS2V5Cg==", cfg.Peers[0].PublicKey)
-	assert.Equal(t, []string{"10.0.0.2/32"}, cfg.Peers[0].AllowedIPs)
-	assert.Equal(t, "192.168.1.1:51820", cfg.Peers[0].Endpoint)
+	return cfg
 }
 
-func TestParseConfig_AllInterfaceOptions(t *testing.T) {
-	configStr := `[Interface]
-PrivateKey = cGVla2Fib28K
-ListenPort = 51820
-Address = 10.0.0.1/24, fd00::1/64
+func TestConfig_RoundTripKeepsFileAsWritten(t *testing.T) {
+	assert.Equal(t, serverConfig, string(parse(t, serverConfig).Bytes()))
+}
+
+func TestConfig_Options(t *testing.T) {
+	cfg := parse(t, `[interface]
+address = 10.0.0.1/24
+Address = fd00::1/64
 DNS = 1.1.1.1, 8.8.8.8
 MTU = 1420
 Table = auto
-FwMark = 0x1234
 PreUp = echo "pre-up"
 PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
+PostUp = ip6tables -A FORWARD -i wg0 -j ACCEPT
 PreDown = echo "pre-down"
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
-SaveConfig = true
-`
+`)
 
-	cfg, err := ParseConfig(strings.NewReader(configStr))
-	require.NoError(t, err)
-
-	assert.Equal(t, "cGVla2Fib28K", cfg.PrivateKey)
-	assert.Equal(t, 51820, cfg.ListenPort)
-	assert.Equal(t, []string{"10.0.0.1/24", "fd00::1/64"}, cfg.Addresses)
-	assert.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, cfg.DNS)
-	assert.Equal(t, 1420, cfg.MTU)
-	assert.Equal(t, "auto", cfg.Table)
-	assert.Equal(t, []string{`echo "pre-up"`}, cfg.PreUp)
-	assert.Equal(t, []string{"iptables -A FORWARD -i wg0 -j ACCEPT"}, cfg.PostUp)
-	assert.Equal(t, []string{`echo "pre-down"`}, cfg.PreDown)
-	assert.Equal(t, []string{"iptables -D FORWARD -i wg0 -j ACCEPT"}, cfg.PostDown)
-	assert.True(t, cfg.SaveConfig)
+	assert.Equal(t, entity.QuickOptions{
+		Addresses: []string{"10.0.0.1/24", "fd00::1/64"},
+		DNS:       []string{"1.1.1.1", "8.8.8.8"},
+		MTU:       1420,
+		Table:     "auto",
+		PreUp:     []string{`echo "pre-up"`},
+		PostUp:    []string{"iptables -A FORWARD -i wg0 -j ACCEPT", "ip6tables -A FORWARD -i wg0 -j ACCEPT"},
+		PreDown:   []string{`echo "pre-down"`},
+		PostDown:  []string{"iptables -D FORWARD -i wg0 -j ACCEPT"},
+	}, cfg.Options())
 }
 
-func TestParseConfig_MultiplePeers(t *testing.T) {
-	configStr := `[Interface]
-PrivateKey = cGVla2Fib28K
-ListenPort = 51820
+func TestConfig_DeviceOfStoppedInterface(t *testing.T) {
+	d := parse(t, serverConfig).Device("wg0")
 
+	assert.Equal(t, "wg0", d.Name)
+	assert.Equal(t, "OLDKEY=", d.PrivateKey)
+	assert.Equal(t, int32(51000), d.ListenPort)
+	assert.Equal(t, int32(16), d.FirewallMark)
+	assert.Equal(t, []string{"10.0.0.1/24", "fd00::1/64"}, d.Addresses)
+	assert.False(t, d.Running)
+}
+
+func running() (*entity.Device, []entity.Peer) {
+	device := &entity.Device{PrivateKey: "NEWKEY=", ListenPort: 51820, FirewallMark: 16}
+	peers := []entity.Peer{
+		{PublicKey: "ALICE=", AllowedIPs: []string{"10.0.0.2/32"}, Endpoint: "203.0.113.5:40000", PersistentKeepaliveInterval: "25s"},
+		{PublicKey: "CAROL=", AllowedIPs: []string{"10.0.0.4/32", "fd00::4/128"}, PersistentKeepaliveInterval: "0s"},
+	}
+	return device, peers
+}
+
+// The regression this package exists to prevent: saving the running state
+// must not wipe Address, DNS, hooks and the rest of the hand-written file.
+func TestConfig_SetRunningKeepsEverythingTheKernelDoesNotKnow(t *testing.T) {
+	cfg := parse(t, serverConfig)
+	cfg.SetRunning(running())
+
+	assert.Equal(t, `# Managed by hand
+[Interface]
+# Server side
+Address = 10.0.0.1/24, fd00::1/64
+PrivateKey = NEWKEY=
+ListenPort = 51820
+FwMark = 0x10
+DNS = 1.1.1.1
+MTU = 1420
+Table = off
+SaveConfig = false
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Alice laptop
 [Peer]
-PublicKey = peer1PublicKey
+PublicKey = ALICE=
 AllowedIPs = 10.0.0.2/32
+Endpoint = 203.0.113.5:40000
 PersistentKeepalive = 25
 
 [Peer]
-PublicKey = peer2PublicKey
-AllowedIPs = 10.0.0.3/32, 10.0.0.4/32
-Endpoint = vpn.example.com:51820
-PresharedKey = cHJlc2hhcmVkS2V5
+PublicKey = CAROL=
+AllowedIPs = 10.0.0.4/32, fd00::4/128
+`, string(cfg.Bytes()))
+}
+
+func TestConfig_SetRunningIsStable(t *testing.T) {
+	cfg := parse(t, serverConfig)
+	cfg.SetRunning(running())
+	once := string(cfg.Bytes())
+
+	again := parse(t, once)
+	again.SetRunning(running())
+	assert.Equal(t, once, string(again.Bytes()))
+}
+
+func TestConfig_SetRunningOnEmptyFile(t *testing.T) {
+	cfg := parse(t, "")
+	cfg.SetRunning(running())
+
+	reread := parse(t, string(cfg.Bytes())).Device("wg0")
+	assert.Equal(t, "NEWKEY=", reread.PrivateKey)
+	assert.Equal(t, int32(51820), reread.ListenPort)
+	assert.Contains(t, string(cfg.Bytes()), "[Peer]\nPublicKey = CAROL=\n")
+}
+
+// A PATCH on the device used to rebuild the file from scratch.
+func TestConfig_SetOptionsKeepsKernelKeysCommentsAndUnknownKeys(t *testing.T) {
+	cfg := parse(t, serverConfig)
+	opts := cfg.Options()
+	opts.DNS = []string{"9.9.9.9"}
+	opts.PostUp = nil
+	opts.PostDown = nil
+	cfg.SetOptions(opts)
+
+	out := string(cfg.Bytes())
+	assert.Contains(t, out, "# Managed by hand\n[Interface]\n# Server side\n")
+	assert.Contains(t, out, "PrivateKey = OLDKEY=\nListenPort = 51000\nFwMark = 0x10\nDNS = 9.9.9.9\n")
+	assert.Contains(t, out, "SaveConfig = false\n")
+	assert.NotContains(t, out, "PostUp")
+	assert.NotContains(t, out, "PostDown")
+	assert.Contains(t, out, "# Bob phone\n[Peer]\nPublicKey = BOB=\n")
+	assert.Equal(t, opts, parse(t, out).Options())
+}
+
+func TestService_UpdateKeepsExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wg0.conf")
+	require.NoError(t, os.WriteFile(path, []byte(serverConfig), 0600))
+	svc, err := NewService([]string{t.TempDir(), dir})
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Update("wg0", func(c *Config) error { c.SetRunning(running()); return nil }))
+
+	cfg, err := svc.LoadConfig("wg0")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.1/24", "fd00::1/64"}, cfg.Options().Addresses)
+	assert.Equal(t, "NEWKEY=", cfg.Device("wg0").PrivateKey)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+}
+
+func TestService_UpdateCreatesFileInFirstDir(t *testing.T) {
+	first := filepath.Join(t.TempDir(), "missing")
+	svc, err := NewService([]string{first, t.TempDir()})
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Update("wg1", func(c *Config) error { c.SetRunning(running()); return nil }))
+
+	_, err = os.Stat(filepath.Join(first, "wg1.conf"))
+	assert.NoError(t, err)
+}
+
+func TestService_UpdateLeavesUnreadableFileAlone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wg0.conf")
+	unreadable := "[Interface]\nPostUp = " + strings.Repeat("x", 128*1024) + "\n"
+	require.NoError(t, os.WriteFile(path, []byte(unreadable), 0600))
+	svc, err := NewService([]string{dir})
+	require.NoError(t, err)
+
+	err = svc.Update("wg0", func(c *Config) error { c.SetRunning(running()); return nil })
+	assert.Error(t, err)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, unreadable, string(data))
+}
+
+func TestService_UpdateWritesNothingWhenEditFails(t *testing.T) {
+	dir := t.TempDir()
+	svc, err := NewService([]string{dir})
+	require.NoError(t, err)
+
+	err = svc.Update("wg0", func(c *Config) error { return os.ErrPermission })
+	assert.ErrorIs(t, err, os.ErrPermission)
+
+	_, err = os.Stat(filepath.Join(dir, "wg0.conf"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// wg-quick ignores everything after a "#", so inline comments must neither
+// hide a peer nor end up in a value.
+func TestConfig_InlineComments(t *testing.T) {
+	file := `[Interface]
+Address = 10.0.0.1/24 # main
+PrivateKey = K=
+
+# Alice
+[Peer]
+PublicKey = ALICE= # phone
+AllowedIPs = 10.0.0.2/32 # phone
+PersistentKeepalive = 25
+
+# end of file
 `
+	cfg := parse(t, file)
+	assert.Equal(t, []string{"10.0.0.1/24"}, cfg.Options().Addresses)
 
-	cfg, err := ParseConfig(strings.NewReader(configStr))
-	require.NoError(t, err)
-
-	assert.Len(t, cfg.Peers, 2)
-
-	// First peer
-	assert.Equal(t, "peer1PublicKey", cfg.Peers[0].PublicKey)
-	assert.Equal(t, []string{"10.0.0.2/32"}, cfg.Peers[0].AllowedIPs)
-	assert.Equal(t, 25, cfg.Peers[0].PersistentKeepaliveInterval)
-
-	// Second peer
-	assert.Equal(t, "peer2PublicKey", cfg.Peers[1].PublicKey)
-	assert.Equal(t, []string{"10.0.0.3/32", "10.0.0.4/32"}, cfg.Peers[1].AllowedIPs)
-	assert.Equal(t, "vpn.example.com:51820", cfg.Peers[1].Endpoint)
-	assert.Equal(t, "cHJlc2hhcmVkS2V5", cfg.Peers[1].PresharedKey)
+	cfg.SetRunning(&entity.Device{PrivateKey: "K="}, []entity.Peer{
+		{PublicKey: "ALICE=", AllowedIPs: []string{"10.0.0.2/32"}, PersistentKeepaliveInterval: "25s"},
+	})
+	assert.Equal(t, file, string(cfg.Bytes()))
 }
 
-func TestParseConfig_Comments(t *testing.T) {
-	configStr := `# This is a comment
-[Interface]
-PrivateKey = cGVla2Fib28K
-# Another comment
-ListenPort = 51820
-`
+func TestConfig_RemovingLastPeerKeepsEndOfFileComment(t *testing.T) {
+	cfg := parse(t, serverConfig+"\n# end of file\n")
+	cfg.SetRunning(&entity.Device{PrivateKey: "OLDKEY=", ListenPort: 51000, FirewallMark: 16}, []entity.Peer{
+		{PublicKey: "ALICE=", AllowedIPs: []string{"10.0.0.2/32"}},
+	})
 
-	cfg, err := ParseConfig(strings.NewReader(configStr))
-	require.NoError(t, err)
-
-	assert.Equal(t, "cGVla2Fib28K", cfg.PrivateKey)
-	assert.Equal(t, 51820, cfg.ListenPort)
-}
-
-func TestParseConfig_EmptyFile(t *testing.T) {
-	cfg, err := ParseConfig(strings.NewReader(""))
-	require.NoError(t, err)
-	assert.Empty(t, cfg.PrivateKey)
-	assert.Empty(t, cfg.Peers)
-}
-
-func TestBuildConfig(t *testing.T) {
-	svc := &Service{configDirs: []string{"/tmp"}}
-
-	device := &entity.Device{
-		Name:       "wg0",
-		PrivateKey: "privateKeyBase64",
-		ListenPort: 51820,
-		Addresses:  []string{"10.0.0.1/24"},
-		DNS:        []string{"1.1.1.1", "8.8.8.8"},
-		MTU:        1420,
-		Table:      "auto",
-		PreUp:      []string{"echo pre-up"},
-		PostUp:     []string{"echo post-up"},
-		PreDown:    []string{"echo pre-down"},
-		PostDown:   []string{"echo post-down"},
-	}
-
-	peers := []entity.Peer{
-		{
-			PublicKey:                   "peerPublicKey",
-			AllowedIPs:                  []string{"10.0.0.2/32"},
-			Endpoint:                    "192.168.1.1:51820",
-			PersistentKeepaliveInterval: "25s",
-		},
-	}
-
-	config := svc.buildConfig(device, peers)
-
-	assert.Contains(t, config, "[Interface]")
-	assert.Contains(t, config, "PrivateKey = privateKeyBase64")
-	assert.Contains(t, config, "ListenPort = 51820")
-	assert.Contains(t, config, "Address = 10.0.0.1/24")
-	assert.Contains(t, config, "DNS = 1.1.1.1, 8.8.8.8")
-	assert.Contains(t, config, "MTU = 1420")
-	assert.Contains(t, config, "Table = auto")
-	assert.Contains(t, config, "PreUp = echo pre-up")
-	assert.Contains(t, config, "PostUp = echo post-up")
-	assert.Contains(t, config, "PreDown = echo pre-down")
-	assert.Contains(t, config, "PostDown = echo post-down")
-
-	assert.Contains(t, config, "[Peer]")
-	assert.Contains(t, config, "PublicKey = peerPublicKey")
-	assert.Contains(t, config, "AllowedIPs = 10.0.0.2/32")
-	assert.Contains(t, config, "Endpoint = 192.168.1.1:51820")
-	assert.Contains(t, config, "PersistentKeepalive = 25s")
-}
-
-func TestGetPlatform(t *testing.T) {
-	platform := GetPlatform()
-	// Should be one of the supported platforms
-	validPlatforms := []string{"linux", "darwin", "freebsd", "windows"}
-	assert.Contains(t, validPlatforms, platform)
-}
-
-func TestNewService(t *testing.T) {
-	// Use a temp directory
-	svc, err := NewService([]string{t.TempDir()})
-	require.NoError(t, err)
-	assert.NotNil(t, svc)
-}
-
-func TestFindConfigPath(t *testing.T) {
-	// Use temp dirs that don't exist anywhere
-	svc := &Service{configDirs: []string{"/nonexistent/first", "/nonexistent/second"}}
-	path := svc.FindConfigPath("wg0")
-	// Returns first dir path when not found
-	assert.Equal(t, "/nonexistent/first/wg0.conf", path)
-}
-
-func TestFindConfigPath_ExistingFile(t *testing.T) {
-	// Create temp dir with a config file
-	tmpDir := t.TempDir()
-	configPath := tmpDir + "/wg0.conf"
-	err := os.WriteFile(configPath, []byte("[Interface]\n"), 0600)
-	require.NoError(t, err)
-
-	svc := &Service{configDirs: []string{"/nonexistent", tmpDir}}
-	path := svc.FindConfigPath("wg0")
-	// Should find the existing file in tmpDir
-	assert.Equal(t, configPath, path)
-}
-
-func TestGetConfigDir(t *testing.T) {
-	// Create temp dir with a config file
-	tmpDir := t.TempDir()
-	configPath := tmpDir + "/wg1.conf"
-	err := os.WriteFile(configPath, []byte("[Interface]\n"), 0600)
-	require.NoError(t, err)
-
-	svc := &Service{configDirs: []string{"/nonexistent", tmpDir}}
-	dir := svc.GetConfigDir("wg1")
-	assert.Equal(t, tmpDir, dir)
-
-	// Non-existent config returns first dir
-	dir = svc.GetConfigDir("wg99")
-	assert.Equal(t, "/nonexistent", dir)
+	out := string(cfg.Bytes())
+	assert.NotContains(t, out, "BOB=")
+	assert.NotContains(t, out, "# Bob phone")
+	assert.True(t, strings.HasSuffix(out, "AllowedIPs = 10.0.0.2/32\n\n# end of file\n"), out)
 }
 
 func TestListConfigDevices(t *testing.T) {
@@ -265,10 +309,3 @@ func TestNewService_EmptyDirs(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "at least one config directory")
 }
-
-func TestConfigDirs(t *testing.T) {
-	dirs := []string{"/a", "/b", "/c"}
-	svc := &Service{configDirs: dirs}
-	assert.Equal(t, dirs, svc.ConfigDirs())
-}
-

@@ -11,8 +11,8 @@ import (
 
 // PeerUseCase handles business logic for peer operations.
 type PeerUseCase struct {
-	wgClient   *wireguard.Client
-	wgquickSvc *wgquick.Service
+	wgClient *wireguard.Client
+	configs  configStore
 }
 
 // NewPeerUseCase creates a new peer use case.
@@ -21,8 +21,8 @@ func NewPeerUseCase(
 	wgquickSvc *wgquick.Service,
 ) *PeerUseCase {
 	return &PeerUseCase{
-		wgClient:   wgClient,
-		wgquickSvc: wgquickSvc,
+		wgClient: wgClient,
+		configs:  configStore{wgClient: wgClient, wgquickSvc: wgquickSvc},
 	}
 }
 
@@ -33,7 +33,6 @@ func (uc *PeerUseCase) ListPeers(deviceName string, page, perPage int, query, so
 		return nil, 0, err
 	}
 
-	// Apply search filter
 	if query != "" {
 		filtered := make([]entity.Peer, 0)
 		queryLower := strings.ToLower(query)
@@ -47,12 +46,10 @@ func (uc *PeerUseCase) ListPeers(deviceName string, page, perPage int, query, so
 		peers = filtered
 	}
 
-	// Apply sorting
 	sortPeers(peers, sortField)
 
 	total := len(peers)
 
-	// Apply pagination
 	if perPage <= 0 {
 		perPage = 100
 	}
@@ -85,8 +82,7 @@ func (uc *PeerUseCase) CreatePeer(deviceName string, req entity.PeerCreateOrUpda
 		return nil, err
 	}
 
-	// Trigger config save
-	uc.saveDeviceConfig(deviceName)
+	uc.configs.saveOrLog(deviceName, nil)
 
 	return peer, nil
 }
@@ -98,8 +94,7 @@ func (uc *PeerUseCase) UpdatePeer(deviceName string, urlSafePubKey string, req e
 		return nil, err
 	}
 
-	// Trigger config save
-	uc.saveDeviceConfig(deviceName)
+	uc.configs.saveOrLog(deviceName, nil)
 
 	return peer, nil
 }
@@ -111,19 +106,10 @@ func (uc *PeerUseCase) DeletePeer(deviceName string, urlSafePubKey string) (*ent
 		return nil, err
 	}
 
-	// Trigger config save
-	uc.saveDeviceConfig(deviceName)
+	uc.configs.saveOrLog(deviceName, nil)
 
 	return peer, nil
 }
-
-func (uc *PeerUseCase) saveDeviceConfig(deviceName string) {
-	// Use wg showconf to save current state
-	if err := uc.wgquickSvc.SaveFromShowconf(deviceName); err != nil {
-		// Log but don't fail
-	}
-}
-
 
 func containsIP(ips []string, query string) bool {
 	for _, ip := range ips {

@@ -17,8 +17,29 @@ type Device struct {
 	// FirewallMark is the device firewall mark
 	FirewallMark int32 `json:"firewall_mark,omitempty"`
 
-	// --- wg-quick [Interface] options ---
+	// wg-quick [Interface] options, flattened into the JSON object.
+	QuickOptions
 
+	// --- Status ---
+
+	// Running indicates if the interface is currently up
+	Running bool `json:"running"`
+
+	// --- Statistics ---
+
+	// PeersCount is the number of connected peers
+	PeersCount int32 `json:"peers_count"`
+
+	// TotalReceiveBytes across all peers
+	TotalReceiveBytes int64 `json:"total_receive_bytes"`
+
+	// TotalTransmitBytes across all peers
+	TotalTransmitBytes int64 `json:"total_transmit_bytes"`
+}
+
+// QuickOptions are the [Interface] settings that only wg-quick understands.
+// The kernel does not know them, so they live in the wg-quick config file.
+type QuickOptions struct {
 	// Addresses are IP addresses to assign to the interface (CIDR notation)
 	Addresses []string `json:"addresses,omitempty"`
 
@@ -42,22 +63,6 @@ type Device struct {
 
 	// PostDown commands to run after interface goes down
 	PostDown []string `json:"post_down,omitempty"`
-
-	// --- Status ---
-
-	// Running indicates if the interface is currently up
-	Running bool `json:"running"`
-
-	// --- Statistics ---
-
-	// PeersCount is the number of connected peers
-	PeersCount int32 `json:"peers_count"`
-
-	// TotalReceiveBytes across all peers
-	TotalReceiveBytes int64 `json:"total_receive_bytes"`
-
-	// TotalTransmitBytes across all peers
-	TotalTransmitBytes int64 `json:"total_transmit_bytes"`
 }
 
 // DeviceCreateOrUpdateRequest represents parameters for creating or updating a device.
@@ -99,4 +104,33 @@ type DeviceCreateOrUpdateRequest struct {
 
 	// PostDown commands
 	PostDown []string `json:"post_down,omitempty"`
+}
+
+// ApplyOptions applies the wg-quick options of the request to o. A field the
+// request leaves out keeps its value; an empty list or string clears it.
+func (r DeviceCreateOrUpdateRequest) ApplyOptions(o *QuickOptions) {
+	if r.Addresses != nil {
+		o.Addresses = r.Addresses
+	}
+	if r.DNS != nil {
+		o.DNS = r.DNS
+	}
+	if r.MTU != nil {
+		o.MTU = *r.MTU
+	}
+	if r.Table != nil {
+		o.Table = *r.Table
+	}
+	if r.PreUp != nil {
+		o.PreUp = r.PreUp
+	}
+	if r.PostUp != nil {
+		o.PostUp = r.PostUp
+	}
+	if r.PreDown != nil {
+		o.PreDown = r.PreDown
+	}
+	if r.PostDown != nil {
+		o.PostDown = r.PostDown
+	}
 }
