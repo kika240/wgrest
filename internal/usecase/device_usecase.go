@@ -155,6 +155,10 @@ func (uc *DeviceUseCase) UpdateDevice(name string, req entity.DeviceCreateOrUpda
 		return nil, err
 	}
 
+	// Start from the existing config values, then apply the requested
+	// changes on top so that they are not overwritten by the file content.
+	uc.enrichDeviceWithConfig(device)
+
 	// Apply wg-quick options
 	if len(req.Addresses) > 0 {
 		device.Addresses = req.Addresses
@@ -180,9 +184,6 @@ func (uc *DeviceUseCase) UpdateDevice(name string, req entity.DeviceCreateOrUpda
 	if len(req.PostDown) > 0 {
 		device.PostDown = req.PostDown
 	}
-
-	// Enrich with existing config values
-	uc.enrichDeviceWithConfig(device)
 
 	// Save wg-quick config
 	peers, _ := uc.wgClient.ListPeers(device.Name)

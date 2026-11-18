@@ -165,7 +165,7 @@ func TestBuildConfig(t *testing.T) {
 	assert.Contains(t, config, "PublicKey = peerPublicKey")
 	assert.Contains(t, config, "AllowedIPs = 10.0.0.2/32")
 	assert.Contains(t, config, "Endpoint = 192.168.1.1:51820")
-	assert.Contains(t, config, "PersistentKeepalive = 25s")
+	assert.Contains(t, config, "PersistentKeepalive = 25\n")
 }
 
 func TestGetPlatform(t *testing.T) {

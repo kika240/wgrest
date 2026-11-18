@@ -38,16 +38,26 @@ func (c *Client) Close() error {
 	return c.ctrl.Close()
 }
 
-// resolveInterfaceName resolves the actual interface name for a logical name.
+// wgRunDir is where wg-quick stores interface name mappings on macOS/BSD.
+var wgRunDir = "/var/run/wireguard"
+
+// usesNameMapping reports whether the platform maps logical names (wg0) to utunX.
+func usesNameMapping() bool {
+	return runtime.GOOS == "darwin" || runtime.GOOS == "freebsd"
+}
+
+// ResolveInterfaceName resolves the actual interface name for a logical name.
 // On macOS/BSD, wg-quick maps wg0 -> utunX and stores mapping in /var/run/wireguard/wg0.name
-func resolveInterfaceName(name string) string {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "freebsd" {
+func ResolveInterfaceName(name string) string {
+	if !usesNameMapping() {
 		return name
 	}
+	return resolveInterfaceNameIn(wgRunDir, name)
+}
 
+func resolveInterfaceNameIn(runDir, name string) string {
 	// Check if there's a name mapping file
-	nameFile := filepath.Join("/var/run/wireguard", name+".name")
-	data, err := os.ReadFile(nameFile)
+	data, err := os.ReadFile(filepath.Join(runDir, name+".name"))
 	if err != nil {
 		return name // No mapping, use original name
 	}
@@ -57,6 +67,39 @@ func resolveInterfaceName(name string) string {
 		return name
 	}
 
+	return realName
+}
+
+func resolveInterfaceName(name string) string {
+	return ResolveInterfaceName(name)
+}
+
+// logicalInterfaceName is the inverse of ResolveInterfaceName: it maps a real
+// interface name (utun7) back to its wg-quick logical name (wg0).
+func logicalInterfaceName(realName string) string {
+	if !usesNameMapping() {
+		return realName
+	}
+	return logicalInterfaceNameIn(wgRunDir, realName)
+}
+
+func logicalInterfaceNameIn(runDir, realName string) string {
+	entries, err := os.ReadDir(runDir)
+	if err != nil {
+		return realName
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".name") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(runDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(data)) == realName {
+			return strings.TrimSuffix(e.Name(), ".name")
+		}
+	}
 	return realName
 }
 
@@ -70,6 +113,9 @@ func (c *Client) List() ([]entity.Device, error) {
 	result := make([]entity.Device, len(devices))
 	for i, d := range devices {
 		result[i] = deviceToEntity(d)
+		// Expose the logical name (wg0) instead of the real one (utun7) so that
+		// callers (API, config dump) address the wg-quick config file.
+		result[i].Name = logicalInterfaceName(d.Name)
 	}
 
 	return result, nil
