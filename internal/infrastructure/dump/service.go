@@ -4,37 +4,27 @@ import (
 	"context"
 	"log"
 	"time"
-
-	"github.com/suquant/wgrest/internal/infrastructure/wgquick"
-	"github.com/suquant/wgrest/internal/infrastructure/wireguard"
 )
 
-// Service provides periodic config dump functionality.
+// Saver writes the running state of every device to its config file.
+type Saver interface {
+	SaveAll() error
+}
+
+// Service saves configs at startup, every interval and on shutdown.
 type Service struct {
-	interval   time.Duration
-	wgClient   *wireguard.Client
-	wgquickSvc *wgquick.Service
+	interval time.Duration
+	saver    Saver
 }
 
 // NewService creates a new dump service.
-func NewService(
-	interval time.Duration,
-	wgClient *wireguard.Client,
-	wgquickSvc *wgquick.Service,
-) *Service {
-	return &Service{
-		interval:   interval,
-		wgClient:   wgClient,
-		wgquickSvc: wgquickSvc,
-	}
+func NewService(interval time.Duration, saver Saver) *Service {
+	return &Service{interval: interval, saver: saver}
 }
 
-// Start begins the periodic dump loop.
+// Start runs until ctx is cancelled.
 func (s *Service) Start(ctx context.Context) {
-	// Do an initial dump
-	if err := s.SaveAll(); err != nil {
-		log.Printf("Initial config dump failed: %v", err)
-	}
+	s.save("Initial")
 
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -42,36 +32,16 @@ func (s *Service) Start(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Final save on shutdown
-			log.Println("Performing final config dump before shutdown...")
-			if err := s.SaveAll(); err != nil {
-				log.Printf("Final config dump failed: %v", err)
-			}
+			s.save("Final")
 			return
 		case <-ticker.C:
-			if err := s.SaveAll(); err != nil {
-				log.Printf("Periodic config dump failed: %v", err)
-			}
+			s.save("Periodic")
 		}
 	}
 }
 
-// SaveAll saves configs for all WireGuard devices using wg showconf.
-func (s *Service) SaveAll() error {
-	devices, err := s.wgClient.List()
-	if err != nil {
-		return err
+func (s *Service) save(kind string) {
+	if err := s.saver.SaveAll(); err != nil {
+		log.Printf("%s config dump failed: %v", kind, err)
 	}
-
-	var lastErr error
-	for _, device := range devices {
-		if err := s.wgquickSvc.SaveFromShowconf(device.Name); err != nil {
-			log.Printf("Failed to save config for %s: %v", device.Name, err)
-			lastErr = err
-		} else {
-			log.Printf("Saved config for interface: %s", device.Name)
-		}
-	}
-
-	return lastErr
 }
